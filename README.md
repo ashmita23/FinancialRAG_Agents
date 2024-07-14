@@ -18,3 +18,4 @@ Col Bert - Reranker for beter retrieval
 Llama 3 - Creating hypothetical queries
 
 Streamlit - Deployment
+![WhatsApp Image 2024-07-14 at 18 21 59](https://github.com/user-attachments/assets/83a58006-b55f-4d95-b611-b3e36c022739)
