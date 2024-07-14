@@ -1,5 +1,5 @@
-#### Financial RAG
-Built a financial RAG using custom agents and open source LLMs for analyzing and summarizing the quarterly reports of 4 major organizations. 
+### Financial RAG for Analyzing Quarterly and Annual Revenue Reports of Tech Organizations.
+Built a financial RAG using custom agents and open source LLMs for analyzing and summarizing the quarterly reports of 4 major organizations. This end to end application was submitted at the MSADS Hackathon 2024 at University of Chicago and secured an Honorable Mention.
 
 Tech Stack :
 
@@ -18,4 +18,9 @@ Col Bert - Reranker for beter retrieval
 Llama 3 - Creating hypothetical queries
 
 Streamlit - Deployment
-![WhatsApp Image 2024-07-14 at 18 21 59](https://github.com/user-attachments/assets/83a58006-b55f-4d95-b611-b3e36c022739)
+
+
+
+
+https://github.com/user-attachments/assets/18485a55-139f-4cf8-893b-9320e3426c2e
+
