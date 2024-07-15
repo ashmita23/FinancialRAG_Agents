@@ -22,5 +22,8 @@ Streamlit - Deployment
 
 
 
-https://github.com/user-attachments/assets/18485a55-139f-4cf8-893b-9320e3426c2e
+https://github.com/user-attachments/assets/07e1bdfa-0f1f-424d-9df8-f72aea90ec7a
+
+
+
 
