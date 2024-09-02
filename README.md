@@ -15,7 +15,7 @@ The technology stack I employed in this project is a carefully curated set of ad
 
 In handling the conversion of visual data into text, Phi3 Vision played a crucial role by summarizing images into a textual format that could be seamlessly integrated into the data pipeline. To enhance the retrieval-augmented generation (RAG) process, I incorporated Instruct-XL, which provides high-quality embeddings that facilitate more accurate and contextually relevant retrievals. For the generation phase, I selected Qwen2, a large language model with an impressive 32K context window, enabling it to generate detailed and context-rich responses.
 
-To ensure that the retrieval process was as precise as possible, I utilized Col Bert, a state-of-the-art reranker that optimizes retrieval results by refining the order based on relevance and quality. In addition, Llama 3 was employed to generate hypothetical queries, further enriching the dataset and improving the model's robustness. Finally, the entire system was deployed using Streamlit, a user-friendly platform that allows for rapid development and deployment of interactive web applications, ensuring that the end product was both functional and accessible.
+To ensure that the retrieval process was as precise as possible, I utilized Col Bert, a state-of-the-art reranker that optimizes retrieval results by refining the order based on relevance and quality. In addition, Llama 3 was employed to generate hypothetical queries, further enriching the dataset and improving the model's robustness. Finally, the entire system was deployed using Streamlit, ensuring that the end product was both functional and accessible.
 
 
 ### Demo:
