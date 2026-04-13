@@ -8,7 +8,7 @@ from typing import Generator
 import anthropic
 from dotenv import load_dotenv
 
-from langchain_community.embeddings import HuggingFaceInstructEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain.storage import InMemoryByteStore
@@ -775,13 +775,9 @@ class FinancialController:
     def _build_retrieval_stack(self) -> None:
         self.vectorstore = Chroma(
             collection_name="docsAndSums",
-            embedding_function=HuggingFaceInstructEmbeddings(
-                model_name="hkunlp/instructor-xl",
-                query_instruction=(
-                    "Embed these chunks and questions for retrieval from Financial Report "
-                    "Documents. The current year is 2026."
-                ),
-            ),
+            embedding_function=HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+),
             persist_directory="chromaDocs",
         )
         self.byte_store = InMemoryByteStore()
