@@ -776,8 +776,8 @@ class FinancialController:
         self.vectorstore = Chroma(
             collection_name="docsAndSums",
             embedding_function=HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-),
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+            ),
             persist_directory="chromaDocs",
         )
         self.byte_store = InMemoryByteStore()
