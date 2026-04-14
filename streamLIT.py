@@ -8,7 +8,7 @@ st.set_page_config(
     page_title="Fortune 500 Financial Analyst",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ---------------------------------------------------------------------------
@@ -17,38 +17,16 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* ── Sidebar ── */
-    [data-testid="stSidebar"] {
-        background: #0A0A0A;
-        color: #FFFFFF;
-    }
-    [data-testid="stSidebar"] * { color: #FFFFFF !important; }
-    [data-testid="stSidebar"] .stButton > button {
-        background: #1C1C1C;
-        color: #E9D5FF !important;
-        border: 1px solid #7C3AED;
-        border-radius: 8px;
-        width: 100%;
-        font-size: 0.85rem;
-        padding: 0.4rem 0.6rem;
-        margin-bottom: 4px;
-        transition: background 0.15s;
-    }
-    [data-testid="stSidebar"] .stButton > button:hover {
-        background: #7C3AED;
-        color: #FFFFFF !important;
-    }
-
     /* ── App header ── */
     .app-header {
         background: linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%);
         border-radius: 12px;
         padding: 1.5rem 2rem;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1rem;
         color: #FFFFFF;
     }
-    .app-header h1 { margin: 0; font-size: 1.9rem; font-weight: 700; }
-    .app-header p  { margin: 0.4rem 0 0; font-size: 0.95rem; opacity: 0.85; }
+    .app-header h1 { margin: 0; font-size: 2.1rem; font-weight: 700; }
+    .app-header p  { margin: 0.4rem 0 0; font-size: 1rem; opacity: 0.85; }
 
     /* ── Agent pipeline chips ── */
     .agent-chips { margin: 0.5rem 0; }
@@ -57,14 +35,14 @@ st.markdown(
         background: #7C3AED;
         color: white;
         border-radius: 12px;
-        padding: 3px 12px;
-        font-size: 0.78rem;
+        padding: 4px 14px;
+        font-size: 0.85rem;
         font-weight: 600;
         margin-right: 4px;
     }
     .chip-arrow {
         color: #9CA3AF;
-        font-size: 0.8rem;
+        font-size: 0.85rem;
         margin-right: 4px;
     }
 
@@ -75,22 +53,34 @@ st.markdown(
         color: #FFFFFF;
         border-radius: 4px;
         padding: 2px 8px;
-        font-size: 0.75rem;
+        font-size: 0.8rem;
         font-weight: 600;
         margin-right: 6px;
     }
     .tool-result-preview {
         color: #4B5563;
         font-family: monospace;
-        font-size: 0.78rem;
+        font-size: 0.82rem;
         white-space: pre-wrap;
         word-break: break-word;
     }
 
     /* ── Risk badge ── */
-    .risk-low    { background:#D1FAE5; border:1px solid #6EE7B7; border-radius:8px; padding:8px 14px; color:#065F46; font-weight:600; }
-    .risk-medium { background:#FEF3C7; border:1px solid #FCD34D; border-radius:8px; padding:8px 14px; color:#92400E; font-weight:600; }
-    .risk-high   { background:#FEE2E2; border:1px solid #FCA5A5; border-radius:8px; padding:8px 14px; color:#991B1B; font-weight:600; }
+    .risk-low    { background:#D1FAE5; border:1px solid #6EE7B7; border-radius:8px; padding:10px 16px; color:#065F46; font-weight:600; font-size:1rem; }
+    .risk-medium { background:#FEF3C7; border:1px solid #FCD34D; border-radius:8px; padding:10px 16px; color:#92400E; font-weight:600; font-size:1rem; }
+    .risk-high   { background:#FEE2E2; border:1px solid #FCA5A5; border-radius:8px; padding:10px 16px; color:#991B1B; font-weight:600; font-size:1rem; }
+
+    /* ── Chat message text — bigger + more readable ── */
+    .stChatMessage .stMarkdown p,
+    .stChatMessage .stMarkdown li {
+        font-size: 1.05rem;
+        line-height: 1.75;
+    }
+    .stChatMessage .stMarkdown h3 {
+        font-size: 1.15rem;
+    }
+    /* Ensure bold always renders */
+    strong { font-weight: 700 !important; }
 
     /* ── Welcome card ── */
     .welcome-card {
@@ -100,6 +90,24 @@ st.markdown(
         padding: 1.5rem;
         text-align: center;
         color: #4B5563;
+        font-size: 1.05rem;
+    }
+
+    /* ── Guide panel company buttons ── */
+    div[data-testid="stHorizontalBlock"] .stButton > button {
+        background: #F5F3FF;
+        color: #5B21B6;
+        border: 1px solid #DDD6FE;
+        border-radius: 20px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        padding: 0.35rem 1rem;
+        transition: all 0.15s;
+    }
+    div[data-testid="stHorizontalBlock"] .stButton > button:hover {
+        background: #7C3AED;
+        color: #FFFFFF;
+        border-color: #7C3AED;
     }
     </style>
     """,
@@ -119,43 +127,12 @@ if "controller" not in st.session_state:
     st.session_state.controller = None
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar — minimal (just clear button; content moved to guide panel)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("## 📊 Fortune 500 Analyst")
-    st.markdown(
-        "Ask financial questions about any **Fortune 500** company.\n\n"
-        "Powered by **4 specialized AI agents** and live market data."
-    )
+    st.markdown("### 📊 Fortune 500 Analyst")
     st.divider()
-
-    st.markdown("**Quick-select (deep knowledge base)**")
-    quick = {
-        "Amazon":  "What was Amazon's revenue and operating income in 2023?",
-        "Apple":   "How did Apple's gross margin trend from 2021 to 2023?",
-        "Alphabet":"What drove Alphabet's revenue growth in 2023?",
-        "Meta":    "What was Meta's net income and free cash flow in 2023?",
-        "NVIDIA":  "Show me NVIDIA's quarterly revenue trend over the last 2 years",
-    }
-    for company, example_q in quick.items():
-        if st.button(company, key=f"q_{company}"):
-            st.session_state["prefill_query"] = example_q
-
-    st.divider()
-    st.markdown("**Any Fortune 500 ticker**")
-    st.caption("Try: WMT, JPM, XOM, TSLA, MSFT, COST, CVX, HD, LLY, UNH …")
-
-    st.divider()
-    st.markdown("**Agent pipeline**")
-    st.caption(
-        "📥 **Retrieval** → fetches raw data\n"
-        "📊 **Metrics** → extracts JSON numbers\n"
-        "🧠 **Analysis** → writes narrative (streamed live)\n"
-        "⚠️ **Risk** → scores 0-10 with red flags"
-    )
-
-    st.divider()
-    if st.button("Clear conversation", key="clear"):
+    if st.button("🗑️ Clear conversation", key="clear"):
         st.session_state.messages = []
         st.session_state.display_history = []
         st.rerun()
@@ -190,6 +167,40 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ---------------------------------------------------------------------------
+# Guide panel — how to use + quick company buttons
+# ---------------------------------------------------------------------------
+_guide_open = not bool(st.session_state.display_history)
+with st.expander("📖  How to use  ·  Quick companies", expanded=_guide_open):
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.markdown(
+            "**How to use**\n"
+            "- Ask about **any Fortune 500 company** by name or ticker\n"
+            "- Include the **year** for precise data — e.g. *'Apple revenue 2023'*\n"
+            "- Use **'compare X vs Y'** to compare two companies side by side\n"
+            "- Use **'trend'** or **'chart'** to get a time series graph\n"
+            "- Follow-up questions remember the prior conversation context\n"
+            "- Try tickers directly: *WMT, JPM, XOM, TSLA, MSFT, CVX, HD, LLY*"
+        )
+
+    with right:
+        st.markdown("**Quick questions — famous companies**")
+        quick = {
+            "Amazon":  "What was Amazon's revenue and operating income in 2023?",
+            "Apple":   "How did Apple's gross margin trend from 2021 to 2023?",
+            "Alphabet": "What drove Alphabet's revenue growth in 2023?",
+            "Meta":    "What was Meta's net income and free cash flow in 2023?",
+            "NVIDIA":  "Show me NVIDIA's quarterly revenue trend over the last 2 years",
+        }
+        cols = st.columns(len(quick))
+        for col, (company, example_q) in zip(cols, quick.items()):
+            with col:
+                if st.button(company, key=f"q_{company}"):
+                    st.session_state["prefill_query"] = example_q
+                    st.rerun()
 
 if not _init_ok:
     st.error(f"Initialisation failed: {_init_error}")
@@ -466,10 +477,9 @@ if user_input:
 
         # ── Determine display text ──
         display_text = final_answer or streamed_text or "_No response generated._"
-        answer_placeholder.markdown(display_text)
+        answer_placeholder.markdown(display_text, unsafe_allow_html=True)
 
-        # ── Extract risk from metrics if embedded in final text ──
-        # (risk is compiled into final_answer but also stored separately for badge)
+        # ── Extract risk from metrics for badge ──
         if pending_metrics:
             # Infer risk level from metrics for badge coloring
             score = None
