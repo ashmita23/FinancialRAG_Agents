@@ -327,11 +327,12 @@ Dollar values must be in billions. Percentages as plain numbers (e.g. 45.2 for 4
 ANALYST_SYSTEM = """You are a senior financial analyst writing for institutional investors.
 You have access to retrieved financial data and structured metrics provided in context.
 Write a clear, insightful narrative analysis covering:
-1. Revenue and growth performance (cite specific figures)
-2. Profitability and margin analysis
-3. Key business changes, trends, or narrative shifts vs prior year
-4. Competitive positioning (if comparison data is provided)
+- Revenue and growth performance (cite specific figures)
+- Profitability and margin analysis
+- Key business changes, trends, or narrative shifts vs prior year
+- Competitive positioning (if comparison data is provided)
 Be concise (3-5 paragraphs). Always cite exact numbers. Focus on what matters most to investors.
+Use bullet points (-) for any lists — never numbered lists.
 Today is April 2026."""
 
 RISK_SYSTEM = """You are a financial risk analyst. Score the company's financial risk on a 0-10 scale:
@@ -397,6 +398,7 @@ class SharedMemory:
         self.period: str = "2023"
         self.requires_comparison: bool = False
         self.requires_chart: bool = False
+        self.is_followup: bool = False
         self.retrieved_context: str = ""
         self.time_series_data: dict = {}   # key → {ticker, metric, period, labels, values}
         self.metrics: dict = {}
@@ -925,6 +927,24 @@ class FinancialController:
         if m:
             memory.period = m.group(1)
 
+    _FOLLOWUP_PATTERNS = {
+        "what about", "can you explain", "tell me more", "elaborate",
+        "why is that", "how so", "and what", "what does that mean",
+        "what caused", "go deeper", "expand on", "more detail",
+    }
+
+    def _detect_followup(self, query: str, memory: SharedMemory, chat_history: list) -> None:
+        """Mark as follow-up if short, no new company, references prior context."""
+        if not chat_history:
+            return
+        q = query.lower()
+        if (
+            len(query.split()) < 12
+            and not memory.companies
+            and any(p in q for p in self._FOLLOWUP_PATTERNS)
+        ):
+            memory.is_followup = True
+
     def _route_from_history(
         self, memory: SharedMemory, chat_history: list
     ) -> None:
@@ -963,13 +983,18 @@ class FinancialController:
         try:
             self._route(query, memory)
             self._route_from_history(memory, chat_history)
+            self._detect_followup(query, memory, chat_history)
 
-            pipeline = [
-                ("retrieval", self.retrieval_agent),
-                ("metrics", self.metrics_agent),
-                ("analyst", self.analyst_agent),
-                ("risk", self.risk_agent),
-            ]
+            # Lite mode: follow-up questions skip Retrieval/Metrics/Risk
+            if memory.is_followup:
+                pipeline = [("analyst", self.analyst_agent)]
+            else:
+                pipeline = [
+                    ("retrieval", self.retrieval_agent),
+                    ("metrics",   self.metrics_agent),
+                    ("analyst",   self.analyst_agent),
+                    ("risk",      self.risk_agent),
+                ]
 
             for agent_name, agent in pipeline:
                 yield {"type": "agent_start", "agent": agent_name}
@@ -1001,23 +1026,7 @@ class FinancialController:
     # Output compiler
     # ------------------------------------------------------------------
     def _compile_output(self, memory: SharedMemory) -> str:
-        parts = []
-        if memory.analysis:
-            parts.append(memory.analysis)
-
-        if memory.risk:
-            score = memory.risk.get("score", "N/A")
-            level = memory.risk.get("level", "Unknown")
-            flags = memory.risk.get("flags", [])
-            explanation = memory.risk.get("explanation", "")
-
-            risk_md = f"\n\n---\n\n### Risk Assessment: {level} ({score}/10)\n"
-            if flags:
-                risk_md += "**Key risk factors:** " + " · ".join(flags) + "\n\n"
-            risk_md += explanation
-            parts.append(risk_md)
-
-        return "".join(parts) or "Analysis complete. No additional detail available."
+        return memory.analysis or "Analysis complete. No additional detail available."
 
 
 # Backward-compatible alias
