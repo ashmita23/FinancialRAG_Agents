@@ -1,21 +1,153 @@
 import os
 import json
 import re
-import joblib
+import hashlib
 import requests
 from typing import Generator
 
 import anthropic
 from dotenv import load_dotenv
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain.retrievers.multi_vector import MultiVectorRetriever
-from langchain.storage import InMemoryByteStore
-from langchain.retrievers import ContextualCompressionRetriever
-from ragatouille import RAGPretrainedModel
+import chromadb
+from sentence_transformers import SentenceTransformer
+from flashrank import Ranker, RerankRequest
+from bs4 import BeautifulSoup
 
 load_dotenv()
+
+
+# =============================================================================
+# RAG Helpers — plain Python, no LangChain
+# =============================================================================
+
+def _chunk_text(text: str, size: int = 400, overlap: int = 80) -> list:
+    """Split text into overlapping word-based chunks."""
+    words = text.split()
+    chunks, i = [], 0
+    while i < len(words):
+        chunk = " ".join(words[i:i + size])
+        if chunk.strip():
+            chunks.append(chunk)
+        i += size - overlap
+    return chunks
+
+
+def _fetch_sec_filing_text(company: str, form_type: str = "10-K") -> str:
+    """Fetch the most recent SEC filing text for a company via EDGAR."""
+    headers = {"User-Agent": "FinancialRAG research@example.com"}
+    try:
+        # Step 1: search EDGAR full-text search for accession number
+        resp = requests.get(
+            "https://efts.sec.gov/LATEST/search-index",
+            params={
+                "q": f'"{company}"',
+                "forms": form_type,
+                "dateRange": "custom",
+                "startdt": "2022-01-01",
+                "enddt": "2024-12-31",
+            },
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("hits", {}).get("hits", [])
+        if not hits:
+            return ""
+        accession = hits[0]["_source"].get("id", "")
+        if not accession:
+            return ""
+
+        # Step 2: build filing index URL from accession number
+        # accession format: "0000320193-24-000006"
+        cik = str(int(accession.split("-")[0]))  # strip leading zeros
+        accession_nodash = accession.replace("-", "")
+        index_url = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{cik}/{accession_nodash}/{accession}-index.htm"
+        )
+
+        # Step 3: parse index page to find main document link
+        idx_resp = requests.get(index_url, headers=headers, timeout=15)
+        idx_resp.raise_for_status()
+        soup = BeautifulSoup(idx_resp.text, "html.parser")
+        doc_link = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.endswith(".htm") and "index" not in href.lower():
+                doc_link = (
+                    f"https://www.sec.gov{href}" if href.startswith("/") else href
+                )
+                break
+        if not doc_link:
+            return ""
+
+        # Step 4: fetch main document and extract clean text
+        doc_resp = requests.get(doc_link, headers=headers, timeout=30)
+        doc_resp.raise_for_status()
+        doc_soup = BeautifulSoup(doc_resp.text, "html.parser")
+        for tag in doc_soup(["script", "style", "table"]):
+            tag.decompose()
+        text = doc_soup.get_text(separator=" ", strip=True)
+        # Cap at 150k chars to keep embedding fast
+        return text[:150_000]
+    except Exception:
+        return ""
+
+
+# =============================================================================
+# RetrievalStack — Chroma + sentence-transformers + flashrank (no LangChain)
+# =============================================================================
+
+class RetrievalStack:
+    """In-memory vector store with live SEC EDGAR fetching and flashrank reranking."""
+
+    def __init__(self):
+        self._db = chromadb.Client()
+        self._col = self._db.get_or_create_collection("filings")
+        self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self._reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+        self._fetched: set = set()
+
+    def fetch_and_index(self, company: str, form_type: str = "10-K") -> str:
+        """Fetch a live SEC filing and index it. No-op if already indexed."""
+        key = f"{company}:{form_type}"
+        if key in self._fetched:
+            return f"Already indexed {company} {form_type}"
+        text = _fetch_sec_filing_text(company, form_type)
+        if not text:
+            return f"Could not fetch {form_type} for {company} from SEC EDGAR"
+        chunks = _chunk_text(text, size=400, overlap=80)
+        if not chunks:
+            return f"No content extracted for {company}"
+        embeddings = self._encoder.encode(chunks).tolist()
+        ids = [
+            hashlib.md5(f"{key}{i}".encode()).hexdigest()
+            for i in range(len(chunks))
+        ]
+        metas = [
+            {"company": company, "form_type": form_type, "chunk": i}
+            for i in range(len(chunks))
+        ]
+        self._col.upsert(
+            documents=chunks, embeddings=embeddings, metadatas=metas, ids=ids
+        )
+        self._fetched.add(key)
+        return f"Indexed {len(chunks)} chunks for {company} {form_type}"
+
+    def search(self, company: str, query: str, k: int = 8) -> list:
+        """Embed query → Chroma similarity → flashrank rerank → top-k passages."""
+        qemb = self._encoder.encode([query]).tolist()
+        where = {"company": company} if company else None
+        n = min(k * 5, 50)
+        results = self._col.query(
+            query_embeddings=qemb, n_results=n, where=where
+        )
+        docs = results["documents"][0] if results["documents"] else []
+        if not docs:
+            return []
+        passages = [{"id": i, "text": d} for i, d in enumerate(docs)]
+        reranked = self._reranker.rerank(RerankRequest(query=query, passages=passages))
+        return [docs[r.id] for r in reranked[:k]]
 
 
 # =============================================================================
@@ -25,19 +157,20 @@ load_dotenv()
 _TOOL_RAG_SEARCH = {
     "name": "rag_search",
     "description": (
-        "Search deep financial knowledge base for Amazon, Apple, Alphabet, Meta, or NVIDIA "
-        "(2020-2024). Includes vision-extracted table and chart summaries. Use FIRST for these 5 companies."
+        "Fetch the most recent 10-K filing from SEC EDGAR for any publicly traded company, "
+        "index it in a vector store, and return the most relevant passages. "
+        "Use this FIRST for any qualitative financial research question about any company."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "company": {
                 "type": "string",
-                "enum": ["Amazon", "Apple", "Alphabet", "Meta", "NVIDIA"],
+                "description": "Company name, e.g. 'Apple', 'Microsoft', 'Tesla', 'Walmart'",
             },
             "query": {
                 "type": "string",
-                "description": "Specific financial question; include year if relevant",
+                "description": "Specific question about the filing, include year if relevant",
             },
         },
         "required": ["company", "query"],
@@ -168,12 +301,12 @@ RISK_TOOLS = [_TOOL_CALCULATOR, _TOOL_WEB_SEARCH]
 
 RETRIEVAL_SYSTEM = """You are a financial data retrieval specialist. Your ONLY job is to gather raw financial data.
 Do NOT analyze, compute growth rates, or interpret — just retrieve.
-For Amazon, Apple, Alphabet, Meta, or NVIDIA: use rag_search first.
-For all other companies: use get_financial_statements and search_sec_filings.
+Use rag_search to fetch live SEC 10-K filings for ANY company mentioned in the query.
+Also use get_financial_statements for structured numerical data (income, balance, cashflow).
 For trend/WoW/MoM/YoY/history/chart questions: also call get_time_series.
 For current prices or news: use web_search.
 Retrieve all relevant data needed to fully answer the query, then stop.
-Today is April 2026. Most recent complete fiscal year in knowledge base: 2023."""
+Today is April 2026."""
 
 METRICS_SYSTEM = """You are a financial metrics extraction specialist.
 You are given raw financial data. Extract key metrics and use financial_calculator for any growth/margin computation.
@@ -278,8 +411,8 @@ class SharedMemory:
 class ToolsImpl:
     """All tool implementations in one place to avoid duplication."""
 
-    def __init__(self, retriever, google_api_key: str, google_cse_id: str):
-        self.retriever = retriever
+    def __init__(self, retrieval_stack: RetrievalStack, google_api_key: str, google_cse_id: str):
+        self.retrieval_stack = retrieval_stack
         self._google_api_key = google_api_key
         self._google_cse_id = google_cse_id
         self.time_series_cache: dict = {}
@@ -298,13 +431,11 @@ class ToolsImpl:
         return fn(**inputs) if fn else f"Unknown tool: {name}"
 
     def _rag_search(self, company: str, query: str) -> str:
-        try:
-            docs = self.retriever.invoke(f"{company} {query}")
-            if not docs:
-                return f"No results found for: {company} {query}"
-            return "\n\n---\n\n".join(d.page_content for d in docs[:5])
-        except Exception as e:
-            return f"RAG search error: {e}"
+        status = self.retrieval_stack.fetch_and_index(company, "10-K")
+        docs = self.retrieval_stack.search(company, query, k=5)
+        if not docs:
+            return f"{status}\nNo matching passages found for: {query}"
+        return f"{status}\n\n" + "\n\n---\n\n".join(docs)
 
     def _get_financial_statements(
         self, ticker: str, statement_type: str, annual: bool = True
@@ -758,56 +889,16 @@ class FinancialController:
         self.client = anthropic.Anthropic(
             api_key=os.environ.get("ANTHROPIC_API_KEY")
         )
-        self._build_retrieval_stack()
+        self._retrieval_stack = RetrievalStack()
         self.tools = ToolsImpl(
-            retriever=self.retriever,
+            retrieval_stack=self._retrieval_stack,
             google_api_key=os.environ.get("GOOGLE_API_KEY", ""),
             google_cse_id=os.environ.get("GOOGLE_CSE_ID", ""),
         )
         self.retrieval_agent = RetrievalAgent(self.client, self.tools)
-        self.metrics_agent = MetricsAgent(self.client, self.tools)
-        self.analyst_agent = AnalystAgent(self.client, self.tools)
-        self.risk_agent = RiskAgent(self.client, self.tools)
-
-    # ------------------------------------------------------------------
-    # Retrieval stack (Chroma + ColBERT — unchanged from v1)
-    # ------------------------------------------------------------------
-    def _build_retrieval_stack(self) -> None:
-        self.vectorstore = Chroma(
-            collection_name="docsAndSums",
-            embedding_function=HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-),
-            persist_directory="chromaDocs",
-        )
-        self.byte_store = InMemoryByteStore()
-        self.base_retriever = MultiVectorRetriever(
-            vectorstore=self.vectorstore,
-            byte_store=self.byte_store,
-            id_key="id",
-            search_type="similarity",
-            search_kwargs={"k": 70},
-        )
-        for pkl_path, attr in [
-            ("allPDFDocs.pkl", "docs"),
-            ("allPDFSums (1).pkl", "sums"),
-        ]:
-            try:
-                data = joblib.load(pkl_path)
-                setattr(self, attr, data if isinstance(data, list) and data else [])
-            except Exception:
-                setattr(self, attr, [])
-
-        all_docs = self.docs + self.sums
-        if all_docs:
-            ids = [d.metadata["id"] for d in all_docs]
-            self.base_retriever.docstore.mset(list(zip(ids, all_docs)))
-
-        colbert = RAGPretrainedModel.from_pretrained("colbert-ir/colbertv2.0")
-        self.retriever = ContextualCompressionRetriever(
-            base_compressor=colbert.as_langchain_document_compressor(k=10),
-            base_retriever=self.base_retriever,
-        )
+        self.metrics_agent   = MetricsAgent(self.client, self.tools)
+        self.analyst_agent   = AnalystAgent(self.client, self.tools)
+        self.risk_agent      = RiskAgent(self.client, self.tools)
 
     # ------------------------------------------------------------------
     # Routing (pattern-based, fast — no extra API call)
