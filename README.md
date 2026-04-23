@@ -1,27 +1,110 @@
-### Financial RAG for Analyzing Quarterly and Annual Revenue Reports of Tech Organizations.
-This end to end application was submitted at the MSADS Hackathon 2024 at University of Chicago and secured an Honorable Mention.
+# Financial RAG Agents — Fortune 500 Financial Analyst
 
-### Problem Statement:
-In the financial sector, analyzing and summarizing quarterly reports from major organizations is a critical task that requires significant time and expertise. These reports are often dense with financial data, complex narratives, and intricate details, making it challenging for analysts to quickly extract actionable insights. The goal of this project was to develop an automated solution that could efficiently process, analyze, and summarize the quarterly reports of four major organizations, thereby streamlining the decision-making process for stakeholders.
+> Honorable Mention, MSADS Hackathon 2024 · University of Chicago
 
-### Solution Overview: 
+## TL;DR
 
-To address this challenge, I built a financial Retrieval-Augmented Generation (RAG) system using custom agents combined with Google API and open-source Large Language Models (LLMs). This system was designed to automatically analyze and summarize the extensive quarterly reports, extracting key financial insights and presenting them in a concise format. By leveraging the capabilities of RAG and LLMs, the solution not only reduced the time required to process these reports but also improved the accuracy and relevance of the insights generated. The project was successfully implemented and recognized for its innovation, securing an Honorable Mention at the MSADS Hackathon 2024 at the University of Chicago.
+Started as a single RAG pipeline for 4 company PDFs (hackathon project). Now a **4-agent AI system** that answers financial questions about any Fortune 500 company — combining a private vector knowledge base, live market data, SEC filings, and streaming responses.
 
+Ask *"How did Apple's gross margin trend from 2021–2023?"* and get: exact figures pulled from annual reports, structured metrics, a concise narrative with cited numbers, and a 0–10 risk score — all in ~15 seconds.
 
-### Process:
+**v1 → v3 in short:** single LLM call → 4 specialized agents → prompt caching + stop button + multi-turn memory.
 
-The technology stack I employed in this project is a carefully curated set of advanced tools designed to handle various aspects of data processing, retrieval, and deployment. For extracting images and tables from unstructured data, I utilized Unstructured.io, a tool known for its capability to efficiently parse and organize complex data formats. To further refine and structure the parsed information, LlamaParse was used, which excels at parsing both text and tables into a format suitable for subsequent analysis.
+A multi-agent AI system that answers financial questions about any Fortune 500 company — combining a private RAG knowledge base, live market data, SEC filings, and a structured 4-agent reasoning pipeline.
 
-In handling the conversion of visual data into text, Phi3 Vision played a crucial role by summarizing images into a textual format that could be seamlessly integrated into the data pipeline. To enhance the retrieval-augmented generation (RAG) process, I incorporated Instruct-XL, which provides high-quality embeddings that facilitate more accurate and contextually relevant retrievals. For the generation phase, I selected Qwen2, a large language model with an impressive 32K context window, enabling it to generate detailed and context-rich responses.
+---
 
-To ensure that the retrieval process was as precise as possible, I utilized Col Bert, a state-of-the-art reranker that optimizes retrieval results by refining the order based on relevance and quality. In addition, Llama 3 was employed to generate hypothetical queries, further enriching the dataset and improving the model's robustness. Finally, the entire system was deployed using Streamlit, ensuring that the end product was both functional and accessible.
+## What Changed: v1 → v3
 
+| | v1 (Hackathon, 2024) | v2 | v3 (Current) |
+|---|---|---|---|
+| **LLM** | Qwen2 (open-source, local) | Claude Sonnet | Claude Sonnet 4.6 |
+| **Agents** | 1 RAG pipeline | 4 agents (sequential) | 4 agents + prompt caching |
+| **Data sources** | 4 company PDFs only | RAG + yfinance | RAG + yfinance + SEC EDGAR + web search |
+| **Coverage** | 4 companies | 5 companies (RAG) | 5 deep + any Fortune 500 via live data |
+| **Retrieval** | ColBERT reranker | ColBERT reranker | MMR (faster, no model load) |
+| **Response time** | ~30–60s | ~20–40s | ~10–20s |
+| **UI** | Basic Streamlit | Dark theme | Dark theme + dark charts + streaming |
+| **Output** | Raw text | Streamed narrative | Narrative + metrics table + risk score + charts |
 
-### Demo:
+---
 
-https://github.com/user-attachments/assets/07e1bdfa-0f1f-424d-9df8-f72aea90ec7a
+## How It Works
 
+A user question flows through 4 specialized agents in sequence:
 
+```
+User Query
+    │
+    ▼
+[1] Retrieval Agent — fetches raw data
+    • RAG knowledge base (Amazon, Apple, Alphabet, Meta, NVIDIA 2020–2024)
+    • yfinance — income statement, balance sheet, cash flow for any ticker
+    • SEC EDGAR — 10-K / 10-Q filings for qualitative context
+    • Web search — current prices, news, analyst ratings
+    │
+    ▼
+[2] Metrics Agent — extracts structured JSON
+    • Revenue, net income, margins, FCF, debt/equity
+    • Uses a financial calculator tool for YoY growth and CAGR
+    │
+    ▼
+[3] Analyst Agent — streams narrative (live)
+    • 5–7 paragraph institutional-grade analysis
+    • Every claim cited with exact figures and fiscal year
+    │
+    ▼
+[4] Risk Agent — scores financial risk 0–10
+    • Low / Medium / High with specific red flags
+    • Uses web search to check for regulatory/legal concerns
+```
 
+---
 
+## Tech Stack
+
+- **LLM**: Claude Sonnet 4.6 (Anthropic) with prompt caching
+- **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2`
+- **Vector DB**: ChromaDB with MMR retrieval
+- **Live data**: yfinance (Fortune 500 financials, TTL-cached)
+- **Filings**: SEC EDGAR full-text search API
+- **Frontend**: Streamlit with Plotly charts (dark theme)
+
+---
+
+## Setup
+
+```bash
+git clone https://github.com/ashmita23/FinancialRAG_Agents
+cd FinancialRAG_Agents
+pip install -r requirements.txt
+
+# Add to .env
+ANTHROPIC_API_KEY=your_key
+GOOGLE_API_KEY=your_key      # optional — enables web search
+GOOGLE_CSE_ID=your_cse_id   # optional
+
+streamlit run streamLIT.py
+```
+
+---
+
+## Example Questions
+
+**Deep knowledge base (RAG):**
+- What was NVIDIA's revenue and net income in FY2023?
+- How did Apple's gross margin trend from 2021 to 2023?
+- What drove Meta's revenue recovery in 2023?
+
+**Live data (any Fortune 500):**
+- What was Microsoft's revenue and net income in 2023?
+- Compare Walmart and Costco revenue for 2023
+- What are the biggest financial risks for Tesla?
+
+**Time series:**
+- Show me NVIDIA's quarterly revenue trend over the last 2 years
+- What is Apple's net income history quarterly?
+
+---
+
+*Originally submitted at MSADS Hackathon 2024, University of Chicago — Honorable Mention.*
