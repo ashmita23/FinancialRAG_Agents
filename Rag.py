@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import joblib
 import requests
 from typing import Generator
@@ -10,12 +11,22 @@ from dotenv import load_dotenv
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain.retrievers.multi_vector import MultiVectorRetriever
-from langchain.storage import InMemoryByteStore
-from langchain.retrievers import ContextualCompressionRetriever
-from ragatouille import RAGPretrainedModel
+from langchain_core.stores import InMemoryByteStore
 
 load_dotenv()
+
+# Module-level TTL cache for yfinance calls (avoids repeated network hits within a session)
+_YF_CACHE: dict = {}
+_YF_TTL = 3600  # 1 hour
+
+
+def _yf_cached(key: str, fetcher):
+    now = time.time()
+    if key in _YF_CACHE and now - _YF_CACHE[key]["ts"] < _YF_TTL:
+        return _YF_CACHE[key]["data"]
+    data = fetcher()
+    _YF_CACHE[key] = {"data": data, "ts": now}
+    return data
 
 
 # =============================================================================
@@ -191,15 +202,19 @@ Output ONLY a single valid JSON object — no markdown fences, no explanatory te
 }
 Dollar values must be in billions. Percentages as plain numbers (e.g. 45.2 for 45.2%). Use null if unavailable."""
 
-ANALYST_SYSTEM = """You are a senior financial analyst writing for institutional investors.
-You have access to retrieved financial data and structured metrics provided in context.
-Write a clear, insightful narrative analysis covering:
-1. Revenue and growth performance (cite specific figures)
-2. Profitability and margin analysis
-3. Key business changes, trends, or narrative shifts vs prior year
-4. Competitive positioning (if comparison data is provided)
-Be concise (3-5 paragraphs). Always cite exact numbers. Focus on what matters most to investors.
-Today is April 2026."""
+ANALYST_SYSTEM = """You are a concise financial analyst. Answer the specific question asked — nothing more.
+
+RULES:
+1. Cite exact numbers with fiscal year (e.g. "$44.87B in FY2023"). Never guess missing data — say "not in provided data."
+2. Lead with a 2-sentence direct answer to the question.
+3. Use bullet points for metrics, NOT paragraphs. Example:
+   • Revenue: $X.XXB (+Y.Y% YoY)
+   • Gross margin: XX.X%
+4. End with one "**Takeaway:**" sentence — the single most important insight.
+5. Total length: 150-250 words maximum. No filler, no preamble, no repetition.
+6. If the question is a comparison, put companies side-by-side in bullets.
+
+Today is April 2026. Most recent fiscal year in knowledge base: 2023-2024 depending on company."""
 
 RISK_SYSTEM = """You are a financial risk analyst. Score the company's financial risk on a 0-10 scale:
 - Revenue declining YoY: +2 points
@@ -312,16 +327,24 @@ class ToolsImpl:
         try:
             import yfinance as yf
 
-            co = yf.Ticker(ticker)
-            pairs = {
-                "income": (co.income_stmt, co.quarterly_income_stmt),
-                "balance": (co.balance_sheet, co.quarterly_balance_sheet),
-                "cashflow": (co.cashflow, co.quarterly_cashflow),
-            }
-            if statement_type not in pairs:
+            freq = "annual" if annual else "quarterly"
+            cache_key = f"stmt_{ticker}_{statement_type}_{freq}"
+
+            def _fetch():
+                co = yf.Ticker(ticker)
+                pairs = {
+                    "income": (co.income_stmt, co.quarterly_income_stmt),
+                    "balance": (co.balance_sheet, co.quarterly_balance_sheet),
+                    "cashflow": (co.cashflow, co.quarterly_cashflow),
+                }
+                if statement_type not in pairs:
+                    return None
+                return pairs[statement_type][0 if annual else 1]
+
+            df = _yf_cached(cache_key, _fetch)
+            if df is None:
                 return f"Unknown statement_type: {statement_type}"
-            df = pairs[statement_type][0 if annual else 1]
-            if df is None or df.empty:
+            if df.empty:
                 return f"No {statement_type} data for {ticker}"
             return df.to_string()
         except Exception as e:
@@ -415,7 +438,7 @@ class ToolsImpl:
             try:
                 import yfinance as yf, pandas as pd
 
-                df = yf.Ticker(ticker).income_stmt
+                df = _yf_cached(f"income_{ticker}_annual", lambda t=ticker: yf.Ticker(t).income_stmt)
                 if df is None or df.empty:
                     results.append(f"{ticker}: No data")
                     continue
@@ -455,17 +478,19 @@ class ToolsImpl:
             co = yf.Ticker(ticker)
             if metric == "price":
                 interval = "1wk" if period == "quarterly" else "1mo"
-                hist = co.history(period="2y", interval=interval)
+                hist = _yf_cached(
+                    f"price_{ticker}_{interval}",
+                    lambda: co.history(period="2y", interval=interval),
+                )
                 if hist.empty:
                     return "No price history available"
                 series = hist["Close"].dropna()
                 labels = [str(idx)[:10] for idx in series.index]
                 values = [round(float(v), 2) for v in series.values]
             else:
-                df = (
-                    co.quarterly_income_stmt
-                    if period == "quarterly"
-                    else co.income_stmt
+                df = _yf_cached(
+                    f"ts_{ticker}_{period}",
+                    lambda: co.quarterly_income_stmt if period == "quarterly" else co.income_stmt,
                 )
                 row_map = {
                     "revenue": "Total Revenue",
@@ -517,6 +542,7 @@ class BaseAgent:
         tool_schemas: list,
         messages: list,
         max_iter: int = 8,
+        max_tokens: int = 4096,
     ) -> Generator:
         """
         Agentic tool-use loop. Yields tool_call / tool_result events.
@@ -526,8 +552,8 @@ class BaseAgent:
         for _ in range(max_iter):
             kwargs: dict = dict(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=messages,
             )
             if tool_schemas:
@@ -615,7 +641,7 @@ class RetrievalAgent(BaseAgent):
 
 class MetricsAgent(BaseAgent):
     def run(self, memory: SharedMemory) -> Generator:
-        context = memory.retrieved_context[:4000]
+        context = memory.retrieved_context[:8000]
         messages = [
             {
                 "role": "user",
@@ -627,7 +653,7 @@ class MetricsAgent(BaseAgent):
                 ),
             }
         ]
-        yield from self._tool_use_loop(METRICS_SYSTEM, METRICS_TOOLS, messages)
+        yield from self._tool_use_loop(METRICS_SYSTEM, METRICS_TOOLS, messages, max_tokens=768)
         memory.metrics = _parse_json(self._last_text)
 
         # Emit chart data events (populated by RetrievalAgent's get_time_series calls)
@@ -640,16 +666,26 @@ class MetricsAgent(BaseAgent):
 # =============================================================================
 
 class AnalystAgent(BaseAgent):
-    def run(self, memory: SharedMemory) -> Generator:
+    def run(self, memory: SharedMemory, chat_history: list = None) -> Generator:
         parts = [
             f"Query: {memory.query}",
             f"Fiscal period of interest: {memory.period}",
         ]
         if memory.companies:
             parts.append(f"Companies: {', '.join(memory.companies)}")
+
+        # Inject recent conversation so follow-up questions have context
+        if chat_history:
+            recent = [m for m in chat_history[-4:] if isinstance(m.get("content"), str)]
+            if recent:
+                parts.append(
+                    "Recent conversation:\n"
+                    + "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in recent)
+                )
+
         if memory.retrieved_context:
             parts.append(
-                f"Retrieved financial data:\n{memory.retrieved_context[:3000]}"
+                f"Retrieved financial data:\n{memory.retrieved_context[:6000]}"
             )
         if memory.metrics:
             parts.append(
@@ -679,8 +715,8 @@ class AnalystAgent(BaseAgent):
         accumulated = ""
         with self.client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=ANALYST_SYSTEM,
+            max_tokens=900,
+            system=[{"type": "text", "text": ANALYST_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
         ) as stream:
             for text in stream.text_stream:
@@ -711,7 +747,7 @@ class RiskAgent(BaseAgent):
                 ),
             }
         ]
-        yield from self._tool_use_loop(RISK_SYSTEM, RISK_TOOLS, messages)
+        yield from self._tool_use_loop(RISK_SYSTEM, RISK_TOOLS, messages, max_tokens=768)
         memory.risk = _parse_json(self._last_text)
 
 
@@ -780,33 +816,10 @@ class FinancialController:
             ),
             persist_directory="chromaDocs",
         )
-        self.byte_store = InMemoryByteStore()
-        self.base_retriever = MultiVectorRetriever(
-            vectorstore=self.vectorstore,
-            byte_store=self.byte_store,
-            id_key="id",
-            search_type="similarity",
-            search_kwargs={"k": 70},
-        )
-        for pkl_path, attr in [
-            ("allPDFDocs.pkl", "docs"),
-            ("allPDFSums (1).pkl", "sums"),
-        ]:
-            try:
-                data = joblib.load(pkl_path)
-                setattr(self, attr, data if isinstance(data, list) and data else [])
-            except Exception:
-                setattr(self, attr, [])
-
-        all_docs = self.docs + self.sums
-        if all_docs:
-            ids = [d.metadata["id"] for d in all_docs]
-            self.base_retriever.docstore.mset(list(zip(ids, all_docs)))
-
-        colbert = RAGPretrainedModel.from_pretrained("colbert-ir/colbertv2.0")
-        self.retriever = ContextualCompressionRetriever(
-            base_compressor=colbert.as_langchain_document_compressor(k=10),
-            base_retriever=self.base_retriever,
+        # MMR balances relevance with diversity — better than top-k similarity alone
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 8, "fetch_k": 20},
         )
 
     # ------------------------------------------------------------------
@@ -837,17 +850,22 @@ class FinancialController:
     def _route_from_history(
         self, memory: SharedMemory, chat_history: list
     ) -> None:
-        """Fallback: extract company from recent chat history if query has none."""
-        if memory.companies:
-            return
+        """Carry forward company and year from recent history when follow-up has none."""
         for msg in reversed(chat_history[-6:]):
-            if isinstance(msg.get("content"), str):
+            if not isinstance(msg.get("content"), str):
+                continue
+            content = msg["content"].lower()
+            if not memory.companies:
                 for keyword, (company, ticker) in _TICKER_MAP.items():
-                    if keyword in msg["content"].lower() and company not in memory.companies:
+                    if keyword in content and company not in memory.companies:
                         memory.companies.append(company)
                         memory.tickers.append(ticker)
-                if memory.companies:
-                    break
+            if memory.period == "2023":  # still default — try to pull year from history
+                m = re.search(r"\b(20\d{2})\b", msg["content"])
+                if m:
+                    memory.period = m.group(1)
+            if memory.companies:
+                break
 
     # ------------------------------------------------------------------
     # Main generator (called by Streamlit)
@@ -883,7 +901,7 @@ class FinancialController:
             for agent_name, agent in pipeline:
                 yield {"type": "agent_start", "agent": agent_name}
                 try:
-                    if agent_name == "retrieval":
+                    if agent_name in ("retrieval", "analyst"):
                         yield from agent.run(memory, chat_history)
                     else:
                         yield from agent.run(memory)
@@ -897,6 +915,10 @@ class FinancialController:
             # Emit structured metrics for table display
             if memory.metrics:
                 yield {"type": "metrics_json", "data": memory.metrics}
+
+            # Emit risk agent's structured output for badge display
+            if memory.risk:
+                yield {"type": "risk_json", "data": memory.risk}
 
             # Final compiled answer (analysis + risk section)
             yield {"type": "final", "text": self._compile_output(memory)}

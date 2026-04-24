@@ -1,5 +1,11 @@
+import re
 import streamlit as st
 from Rag import FinancialController
+
+
+def _fix_md(text: str) -> str:
+    """Escape bare dollar signs so Streamlit doesn't treat them as LaTeX delimiters."""
+    return re.sub(r'(?<!\\)\$', r'\\$', text)
 
 # ---------------------------------------------------------------------------
 # Page config — must be first Streamlit call
@@ -110,13 +116,15 @@ st.markdown(
 # Session state
 # ---------------------------------------------------------------------------
 if "messages" not in st.session_state:
-    st.session_state.messages = []          # API-format, passed to generate()
-
+    st.session_state.messages = []
 if "display_history" not in st.session_state:
-    st.session_state.display_history = []   # UI-format, for rendering
-
+    st.session_state.display_history = []
 if "controller" not in st.session_state:
     st.session_state.controller = None
+if "generating" not in st.session_state:
+    st.session_state.generating = False
+if "stop_requested" not in st.session_state:
+    st.session_state.stop_requested = False
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -155,9 +163,14 @@ with st.sidebar:
     )
 
     st.divider()
+    if st.session_state.generating:
+        if st.button("⏹ Stop generating", key="stop", type="primary"):
+            st.session_state.stop_requested = True
     if st.button("Clear conversation", key="clear"):
         st.session_state.messages = []
         st.session_state.display_history = []
+        st.session_state.generating = False
+        st.session_state.stop_requested = False
         st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -336,26 +349,40 @@ def render_chart(chart: dict) -> None:
                 x=labels,
                 y=values,
                 mode="lines+markers",
-                line=dict(color="#7C3AED", width=2.5),
-                marker=dict(size=6, color="#7C3AED"),
+                line=dict(color="#A78BFA", width=2.5),
+                marker=dict(size=7, color="#7C3AED", line=dict(color="#A78BFA", width=1)),
                 fill="tozeroy",
-                fillcolor="rgba(124,58,237,0.08)",
+                fillcolor="rgba(124,58,237,0.15)",
+                hovertemplate="%{x}<br><b>%{y:.2f}</b><extra></extra>",
             )
         )
-        y_title = "Stock Price ($)" if is_price else f"{metric} ($ Billions)"
+        y_title = "Stock Price (USD)" if is_price else f"{metric} (USD Billions)"
         fig.update_layout(
             title=dict(
                 text=f"{ticker} — {metric} ({period.title()})",
-                font=dict(size=14, color="#0A0A0A"),
+                font=dict(size=14, color="#E9D5FF", family="Inter, sans-serif"),
+                x=0.01,
             ),
             xaxis_title="Period",
             yaxis_title=y_title,
-            height=320,
+            height=300,
             margin=dict(l=10, r=10, t=45, b=10),
-            paper_bgcolor="white",
-            plot_bgcolor="#F9F7FF",
-            xaxis=dict(tickangle=-30),
+            paper_bgcolor="#0A0A0A",
+            plot_bgcolor="#111111",
+            font=dict(color="#9CA3AF", size=11),
+            xaxis=dict(
+                tickangle=-30,
+                gridcolor="#1F1F1F",
+                linecolor="#2D2D2D",
+                tickfont=dict(color="#9CA3AF"),
+            ),
+            yaxis=dict(
+                gridcolor="#1F1F1F",
+                linecolor="#2D2D2D",
+                tickfont=dict(color="#9CA3AF"),
+            ),
             hovermode="x unified",
+            hoverlabel=dict(bgcolor="#1C1C1C", font_color="#E9D5FF", bordercolor="#7C3AED"),
         )
         st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
@@ -364,7 +391,7 @@ def render_chart(chart: dict) -> None:
 
 def render_assistant_entry(entry: dict) -> None:
     """Render a full assistant chat entry with all its components."""
-    st.markdown(entry["content"])
+    st.markdown(_fix_md(entry["content"]))
     render_agent_chips(entry.get("agents", []))
     render_metrics_table(entry.get("metrics", {}))
     render_risk_badge(entry.get("risk", {}))
@@ -421,11 +448,16 @@ if user_input:
 
     with st.chat_message("assistant"):
         answer_placeholder = st.empty()
+        st.session_state.generating = True
+        st.session_state.stop_requested = False
 
         with st.status("Starting analysis…", expanded=False) as status_box:
             for event in controller.generate(
                 user_input, st.session_state.messages
             ):
+                if st.session_state.get("stop_requested"):
+                    status_box.update(label="Stopped", state="complete", expanded=False)
+                    break
                 etype = event.get("type")
 
                 if etype == "agent_start":
@@ -448,13 +480,16 @@ if user_input:
 
                 elif etype == "text_delta":
                     streamed_text += event["text"]
-                    answer_placeholder.markdown(streamed_text + " ▌")
+                    answer_placeholder.markdown(_fix_md(streamed_text) + " ▌")
 
                 elif etype == "chart_data":
                     pending_charts.append(event)
 
                 elif etype == "metrics_json":
                     pending_metrics = event.get("data", {})
+
+                elif etype == "risk_json":
+                    pending_risk = event.get("data", {})
 
                 elif etype == "final":
                     final_answer = event.get("text", "")
@@ -466,32 +501,12 @@ if user_input:
 
         # ── Determine display text ──
         display_text = final_answer or streamed_text or "_No response generated._"
-        answer_placeholder.markdown(display_text)
+        if streamed_text and not final_answer:
+            display_text = streamed_text  # stopped early — show what we got
+        answer_placeholder.markdown(_fix_md(display_text))
 
-        # ── Extract risk from metrics if embedded in final text ──
-        # (risk is compiled into final_answer but also stored separately for badge)
-        if pending_metrics:
-            # Infer risk level from metrics for badge coloring
-            score = None
-            flags = []
-            rev_growth = pending_metrics.get("revenue_growth_pct")
-            net_income = pending_metrics.get("net_income_b")
-            op_margin = pending_metrics.get("operating_margin_pct")
-            fcf = pending_metrics.get("free_cash_flow_b")
-            de = pending_metrics.get("debt_to_equity")
-            _score = 0
-            if rev_growth is not None and rev_growth < 0:
-                _score += 2; flags.append("Revenue declining")
-            if net_income is not None and net_income < 0:
-                _score += 3; flags.append("Net income negative")
-            if de is not None and de > 3:
-                _score += 2; flags.append("High debt/equity")
-            if fcf is not None and fcf < 0:
-                _score += 2; flags.append("Negative FCF")
-            if op_margin is not None and op_margin < 5:
-                _score += 1; flags.append("Low operating margin")
-            level = "Low" if _score <= 3 else ("Medium" if _score <= 6 else "High")
-            pending_risk = {"score": _score, "level": level, "flags": flags}
+        st.session_state.generating = False
+        st.session_state.stop_requested = False
 
         # ── Post-stream rendering ──
         render_agent_chips(completed_agents)
