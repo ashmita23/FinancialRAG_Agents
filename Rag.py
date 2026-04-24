@@ -1,153 +1,32 @@
 import os
 import json
 import re
-import hashlib
+import time
+import joblib
 import requests
 from typing import Generator
 
 import anthropic
 from dotenv import load_dotenv
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-from flashrank import Ranker, RerankRequest
-from bs4 import BeautifulSoup
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.stores import InMemoryByteStore
 
 load_dotenv()
 
-
-# =============================================================================
-# RAG Helpers — plain Python, no LangChain
-# =============================================================================
-
-def _chunk_text(text: str, size: int = 400, overlap: int = 80) -> list:
-    """Split text into overlapping word-based chunks."""
-    words = text.split()
-    chunks, i = [], 0
-    while i < len(words):
-        chunk = " ".join(words[i:i + size])
-        if chunk.strip():
-            chunks.append(chunk)
-        i += size - overlap
-    return chunks
+# Module-level TTL cache for yfinance calls (avoids repeated network hits within a session)
+_YF_CACHE: dict = {}
+_YF_TTL = 3600  # 1 hour
 
 
-def _fetch_sec_filing_text(company: str, form_type: str = "10-K") -> str:
-    """Fetch the most recent SEC filing text for a company via EDGAR."""
-    headers = {"User-Agent": "FinancialRAG research@example.com"}
-    try:
-        # Step 1: search EDGAR full-text search for accession number
-        resp = requests.get(
-            "https://efts.sec.gov/LATEST/search-index",
-            params={
-                "q": f'"{company}"',
-                "forms": form_type,
-                "dateRange": "custom",
-                "startdt": "2022-01-01",
-                "enddt": "2024-12-31",
-            },
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        hits = resp.json().get("hits", {}).get("hits", [])
-        if not hits:
-            return ""
-        accession = hits[0]["_source"].get("id", "")
-        if not accession:
-            return ""
-
-        # Step 2: build filing index URL from accession number
-        # accession format: "0000320193-24-000006"
-        cik = str(int(accession.split("-")[0]))  # strip leading zeros
-        accession_nodash = accession.replace("-", "")
-        index_url = (
-            f"https://www.sec.gov/Archives/edgar/data/"
-            f"{cik}/{accession_nodash}/{accession}-index.htm"
-        )
-
-        # Step 3: parse index page to find main document link
-        idx_resp = requests.get(index_url, headers=headers, timeout=15)
-        idx_resp.raise_for_status()
-        soup = BeautifulSoup(idx_resp.text, "html.parser")
-        doc_link = None
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.endswith(".htm") and "index" not in href.lower():
-                doc_link = (
-                    f"https://www.sec.gov{href}" if href.startswith("/") else href
-                )
-                break
-        if not doc_link:
-            return ""
-
-        # Step 4: fetch main document and extract clean text
-        doc_resp = requests.get(doc_link, headers=headers, timeout=30)
-        doc_resp.raise_for_status()
-        doc_soup = BeautifulSoup(doc_resp.text, "html.parser")
-        for tag in doc_soup(["script", "style", "table"]):
-            tag.decompose()
-        text = doc_soup.get_text(separator=" ", strip=True)
-        # Cap at 150k chars to keep embedding fast
-        return text[:150_000]
-    except Exception:
-        return ""
-
-
-# =============================================================================
-# RetrievalStack — Chroma + sentence-transformers + flashrank (no LangChain)
-# =============================================================================
-
-class RetrievalStack:
-    """In-memory vector store with live SEC EDGAR fetching and flashrank reranking."""
-
-    def __init__(self):
-        self._db = chromadb.Client()
-        self._col = self._db.get_or_create_collection("filings")
-        self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
-        self._reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
-        self._fetched: set = set()
-
-    def fetch_and_index(self, company: str, form_type: str = "10-K") -> str:
-        """Fetch a live SEC filing and index it. No-op if already indexed."""
-        key = f"{company}:{form_type}"
-        if key in self._fetched:
-            return f"Already indexed {company} {form_type}"
-        text = _fetch_sec_filing_text(company, form_type)
-        if not text:
-            return f"Could not fetch {form_type} for {company} from SEC EDGAR"
-        chunks = _chunk_text(text, size=400, overlap=80)
-        if not chunks:
-            return f"No content extracted for {company}"
-        embeddings = self._encoder.encode(chunks).tolist()
-        ids = [
-            hashlib.md5(f"{key}{i}".encode()).hexdigest()
-            for i in range(len(chunks))
-        ]
-        metas = [
-            {"company": company, "form_type": form_type, "chunk": i}
-            for i in range(len(chunks))
-        ]
-        self._col.upsert(
-            documents=chunks, embeddings=embeddings, metadatas=metas, ids=ids
-        )
-        self._fetched.add(key)
-        return f"Indexed {len(chunks)} chunks for {company} {form_type}"
-
-    def search(self, company: str, query: str, k: int = 8) -> list:
-        """Embed query → Chroma similarity → flashrank rerank → top-k passages."""
-        qemb = self._encoder.encode([query]).tolist()
-        where = {"company": company} if company else None
-        n = min(k * 5, 50)
-        results = self._col.query(
-            query_embeddings=qemb, n_results=n, where=where
-        )
-        docs = results["documents"][0] if results["documents"] else []
-        if not docs:
-            return []
-        passages = [{"id": i, "text": d} for i, d in enumerate(docs)]
-        reranked = self._reranker.rerank(RerankRequest(query=query, passages=passages))
-        return [docs[r.id] for r in reranked[:k]]
+def _yf_cached(key: str, fetcher):
+    now = time.time()
+    if key in _YF_CACHE and now - _YF_CACHE[key]["ts"] < _YF_TTL:
+        return _YF_CACHE[key]["data"]
+    data = fetcher()
+    _YF_CACHE[key] = {"data": data, "ts": now}
+    return data
 
 
 # =============================================================================
@@ -157,20 +36,19 @@ class RetrievalStack:
 _TOOL_RAG_SEARCH = {
     "name": "rag_search",
     "description": (
-        "Fetch the most recent 10-K filing from SEC EDGAR for any publicly traded company, "
-        "index it in a vector store, and return the most relevant passages. "
-        "Use this FIRST for any qualitative financial research question about any company."
+        "Search deep financial knowledge base for Amazon, Apple, Alphabet, Meta, or NVIDIA "
+        "(2020-2024). Includes vision-extracted table and chart summaries. Use FIRST for these 5 companies."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "company": {
                 "type": "string",
-                "description": "Company name, e.g. 'Apple', 'Microsoft', 'Tesla', 'Walmart'",
+                "enum": ["Amazon", "Apple", "Alphabet", "Meta", "NVIDIA"],
             },
             "query": {
                 "type": "string",
-                "description": "Specific question about the filing, include year if relevant",
+                "description": "Specific financial question; include year if relevant",
             },
         },
         "required": ["company", "query"],
@@ -301,12 +179,12 @@ RISK_TOOLS = [_TOOL_CALCULATOR, _TOOL_WEB_SEARCH]
 
 RETRIEVAL_SYSTEM = """You are a financial data retrieval specialist. Your ONLY job is to gather raw financial data.
 Do NOT analyze, compute growth rates, or interpret — just retrieve.
-Use rag_search to fetch live SEC 10-K filings for ANY company mentioned in the query.
-Also use get_financial_statements for structured numerical data (income, balance, cashflow).
+For Amazon, Apple, Alphabet, Meta, or NVIDIA: use rag_search first.
+For all other companies: use get_financial_statements and search_sec_filings.
 For trend/WoW/MoM/YoY/history/chart questions: also call get_time_series.
 For current prices or news: use web_search.
 Retrieve all relevant data needed to fully answer the query, then stop.
-Today is April 2026."""
+Today is April 2026. Most recent complete fiscal year in knowledge base: 2023."""
 
 METRICS_SYSTEM = """You are a financial metrics extraction specialist.
 You are given raw financial data. Extract key metrics and use financial_calculator for any growth/margin computation.
@@ -324,16 +202,19 @@ Output ONLY a single valid JSON object — no markdown fences, no explanatory te
 }
 Dollar values must be in billions. Percentages as plain numbers (e.g. 45.2 for 45.2%). Use null if unavailable."""
 
-ANALYST_SYSTEM = """You are a senior financial analyst writing for institutional investors.
-You have access to retrieved financial data and structured metrics provided in context.
-Write a clear, insightful narrative analysis covering:
-- Revenue and growth performance (cite specific figures)
-- Profitability and margin analysis
-- Key business changes, trends, or narrative shifts vs prior year
-- Competitive positioning (if comparison data is provided)
-Be concise (3-5 paragraphs). Always cite exact numbers. Focus on what matters most to investors.
-Use bullet points (-) for any lists — never numbered lists.
-Today is April 2026."""
+ANALYST_SYSTEM = """You are a concise financial analyst. Answer the specific question asked — nothing more.
+
+RULES:
+1. Cite exact numbers with fiscal year (e.g. "$44.87B in FY2023"). Never guess missing data — say "not in provided data."
+2. Lead with a 2-sentence direct answer to the question.
+3. Use bullet points for metrics, NOT paragraphs. Example:
+   • Revenue: $X.XXB (+Y.Y% YoY)
+   • Gross margin: XX.X%
+4. End with one "**Takeaway:**" sentence — the single most important insight.
+5. Total length: 150-250 words maximum. No filler, no preamble, no repetition.
+6. If the question is a comparison, put companies side-by-side in bullets.
+
+Today is April 2026. Most recent fiscal year in knowledge base: 2023-2024 depending on company."""
 
 RISK_SYSTEM = """You are a financial risk analyst. Score the company's financial risk on a 0-10 scale:
 - Revenue declining YoY: +2 points
@@ -398,7 +279,6 @@ class SharedMemory:
         self.period: str = "2023"
         self.requires_comparison: bool = False
         self.requires_chart: bool = False
-        self.is_followup: bool = False
         self.retrieved_context: str = ""
         self.time_series_data: dict = {}   # key → {ticker, metric, period, labels, values}
         self.metrics: dict = {}
@@ -413,8 +293,8 @@ class SharedMemory:
 class ToolsImpl:
     """All tool implementations in one place to avoid duplication."""
 
-    def __init__(self, retrieval_stack: RetrievalStack, google_api_key: str, google_cse_id: str):
-        self.retrieval_stack = retrieval_stack
+    def __init__(self, retriever, google_api_key: str, google_cse_id: str):
+        self.retriever = retriever
         self._google_api_key = google_api_key
         self._google_cse_id = google_cse_id
         self.time_series_cache: dict = {}
@@ -433,11 +313,13 @@ class ToolsImpl:
         return fn(**inputs) if fn else f"Unknown tool: {name}"
 
     def _rag_search(self, company: str, query: str) -> str:
-        status = self.retrieval_stack.fetch_and_index(company, "10-K")
-        docs = self.retrieval_stack.search(company, query, k=5)
-        if not docs:
-            return f"{status}\nNo matching passages found for: {query}"
-        return f"{status}\n\n" + "\n\n---\n\n".join(docs)
+        try:
+            docs = self.retriever.invoke(f"{company} {query}")
+            if not docs:
+                return f"No results found for: {company} {query}"
+            return "\n\n---\n\n".join(d.page_content for d in docs[:5])
+        except Exception as e:
+            return f"RAG search error: {e}"
 
     def _get_financial_statements(
         self, ticker: str, statement_type: str, annual: bool = True
@@ -445,16 +327,24 @@ class ToolsImpl:
         try:
             import yfinance as yf
 
-            co = yf.Ticker(ticker)
-            pairs = {
-                "income": (co.income_stmt, co.quarterly_income_stmt),
-                "balance": (co.balance_sheet, co.quarterly_balance_sheet),
-                "cashflow": (co.cashflow, co.quarterly_cashflow),
-            }
-            if statement_type not in pairs:
+            freq = "annual" if annual else "quarterly"
+            cache_key = f"stmt_{ticker}_{statement_type}_{freq}"
+
+            def _fetch():
+                co = yf.Ticker(ticker)
+                pairs = {
+                    "income": (co.income_stmt, co.quarterly_income_stmt),
+                    "balance": (co.balance_sheet, co.quarterly_balance_sheet),
+                    "cashflow": (co.cashflow, co.quarterly_cashflow),
+                }
+                if statement_type not in pairs:
+                    return None
+                return pairs[statement_type][0 if annual else 1]
+
+            df = _yf_cached(cache_key, _fetch)
+            if df is None:
                 return f"Unknown statement_type: {statement_type}"
-            df = pairs[statement_type][0 if annual else 1]
-            if df is None or df.empty:
+            if df.empty:
                 return f"No {statement_type} data for {ticker}"
             return df.to_string()
         except Exception as e:
@@ -548,7 +438,7 @@ class ToolsImpl:
             try:
                 import yfinance as yf, pandas as pd
 
-                df = yf.Ticker(ticker).income_stmt
+                df = _yf_cached(f"income_{ticker}_annual", lambda t=ticker: yf.Ticker(t).income_stmt)
                 if df is None or df.empty:
                     results.append(f"{ticker}: No data")
                     continue
@@ -588,17 +478,19 @@ class ToolsImpl:
             co = yf.Ticker(ticker)
             if metric == "price":
                 interval = "1wk" if period == "quarterly" else "1mo"
-                hist = co.history(period="2y", interval=interval)
+                hist = _yf_cached(
+                    f"price_{ticker}_{interval}",
+                    lambda: co.history(period="2y", interval=interval),
+                )
                 if hist.empty:
                     return "No price history available"
                 series = hist["Close"].dropna()
                 labels = [str(idx)[:10] for idx in series.index]
                 values = [round(float(v), 2) for v in series.values]
             else:
-                df = (
-                    co.quarterly_income_stmt
-                    if period == "quarterly"
-                    else co.income_stmt
+                df = _yf_cached(
+                    f"ts_{ticker}_{period}",
+                    lambda: co.quarterly_income_stmt if period == "quarterly" else co.income_stmt,
                 )
                 row_map = {
                     "revenue": "Total Revenue",
@@ -650,6 +542,7 @@ class BaseAgent:
         tool_schemas: list,
         messages: list,
         max_iter: int = 8,
+        max_tokens: int = 4096,
     ) -> Generator:
         """
         Agentic tool-use loop. Yields tool_call / tool_result events.
@@ -659,8 +552,8 @@ class BaseAgent:
         for _ in range(max_iter):
             kwargs: dict = dict(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=messages,
             )
             if tool_schemas:
@@ -748,7 +641,7 @@ class RetrievalAgent(BaseAgent):
 
 class MetricsAgent(BaseAgent):
     def run(self, memory: SharedMemory) -> Generator:
-        context = memory.retrieved_context[:4000]
+        context = memory.retrieved_context[:8000]
         messages = [
             {
                 "role": "user",
@@ -760,7 +653,7 @@ class MetricsAgent(BaseAgent):
                 ),
             }
         ]
-        yield from self._tool_use_loop(METRICS_SYSTEM, METRICS_TOOLS, messages)
+        yield from self._tool_use_loop(METRICS_SYSTEM, METRICS_TOOLS, messages, max_tokens=768)
         memory.metrics = _parse_json(self._last_text)
 
         # Emit chart data events (populated by RetrievalAgent's get_time_series calls)
@@ -773,16 +666,26 @@ class MetricsAgent(BaseAgent):
 # =============================================================================
 
 class AnalystAgent(BaseAgent):
-    def run(self, memory: SharedMemory) -> Generator:
+    def run(self, memory: SharedMemory, chat_history: list = None) -> Generator:
         parts = [
             f"Query: {memory.query}",
             f"Fiscal period of interest: {memory.period}",
         ]
         if memory.companies:
             parts.append(f"Companies: {', '.join(memory.companies)}")
+
+        # Inject recent conversation so follow-up questions have context
+        if chat_history:
+            recent = [m for m in chat_history[-4:] if isinstance(m.get("content"), str)]
+            if recent:
+                parts.append(
+                    "Recent conversation:\n"
+                    + "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in recent)
+                )
+
         if memory.retrieved_context:
             parts.append(
-                f"Retrieved financial data:\n{memory.retrieved_context[:3000]}"
+                f"Retrieved financial data:\n{memory.retrieved_context[:6000]}"
             )
         if memory.metrics:
             parts.append(
@@ -812,8 +715,8 @@ class AnalystAgent(BaseAgent):
         accumulated = ""
         with self.client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=ANALYST_SYSTEM,
+            max_tokens=900,
+            system=[{"type": "text", "text": ANALYST_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
         ) as stream:
             for text in stream.text_stream:
@@ -844,7 +747,7 @@ class RiskAgent(BaseAgent):
                 ),
             }
         ]
-        yield from self._tool_use_loop(RISK_SYSTEM, RISK_TOOLS, messages)
+        yield from self._tool_use_loop(RISK_SYSTEM, RISK_TOOLS, messages, max_tokens=768)
         memory.risk = _parse_json(self._last_text)
 
 
@@ -891,16 +794,33 @@ class FinancialController:
         self.client = anthropic.Anthropic(
             api_key=os.environ.get("ANTHROPIC_API_KEY")
         )
-        self._retrieval_stack = RetrievalStack()
+        self._build_retrieval_stack()
         self.tools = ToolsImpl(
-            retrieval_stack=self._retrieval_stack,
+            retriever=self.retriever,
             google_api_key=os.environ.get("GOOGLE_API_KEY", ""),
             google_cse_id=os.environ.get("GOOGLE_CSE_ID", ""),
         )
         self.retrieval_agent = RetrievalAgent(self.client, self.tools)
-        self.metrics_agent   = MetricsAgent(self.client, self.tools)
-        self.analyst_agent   = AnalystAgent(self.client, self.tools)
-        self.risk_agent      = RiskAgent(self.client, self.tools)
+        self.metrics_agent = MetricsAgent(self.client, self.tools)
+        self.analyst_agent = AnalystAgent(self.client, self.tools)
+        self.risk_agent = RiskAgent(self.client, self.tools)
+
+    # ------------------------------------------------------------------
+    # Retrieval stack (Chroma + ColBERT — unchanged from v1)
+    # ------------------------------------------------------------------
+    def _build_retrieval_stack(self) -> None:
+        self.vectorstore = Chroma(
+            collection_name="docsAndSums",
+            embedding_function=HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+            ),
+            persist_directory="chromaDocs",
+        )
+        # MMR balances relevance with diversity — better than top-k similarity alone
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 8, "fetch_k": 20},
+        )
 
     # ------------------------------------------------------------------
     # Routing (pattern-based, fast — no extra API call)
@@ -927,38 +847,25 @@ class FinancialController:
         if m:
             memory.period = m.group(1)
 
-    _FOLLOWUP_PATTERNS = {
-        "what about", "can you explain", "tell me more", "elaborate",
-        "why is that", "how so", "and what", "what does that mean",
-        "what caused", "go deeper", "expand on", "more detail",
-    }
-
-    def _detect_followup(self, query: str, memory: SharedMemory, chat_history: list) -> None:
-        """Mark as follow-up if short, no new company, references prior context."""
-        if not chat_history:
-            return
-        q = query.lower()
-        if (
-            len(query.split()) < 12
-            and not memory.companies
-            and any(p in q for p in self._FOLLOWUP_PATTERNS)
-        ):
-            memory.is_followup = True
-
     def _route_from_history(
         self, memory: SharedMemory, chat_history: list
     ) -> None:
-        """Fallback: extract company from recent chat history if query has none."""
-        if memory.companies:
-            return
+        """Carry forward company and year from recent history when follow-up has none."""
         for msg in reversed(chat_history[-6:]):
-            if isinstance(msg.get("content"), str):
+            if not isinstance(msg.get("content"), str):
+                continue
+            content = msg["content"].lower()
+            if not memory.companies:
                 for keyword, (company, ticker) in _TICKER_MAP.items():
-                    if keyword in msg["content"].lower() and company not in memory.companies:
+                    if keyword in content and company not in memory.companies:
                         memory.companies.append(company)
                         memory.tickers.append(ticker)
-                if memory.companies:
-                    break
+            if memory.period == "2023":  # still default — try to pull year from history
+                m = re.search(r"\b(20\d{2})\b", msg["content"])
+                if m:
+                    memory.period = m.group(1)
+            if memory.companies:
+                break
 
     # ------------------------------------------------------------------
     # Main generator (called by Streamlit)
@@ -983,23 +890,18 @@ class FinancialController:
         try:
             self._route(query, memory)
             self._route_from_history(memory, chat_history)
-            self._detect_followup(query, memory, chat_history)
 
-            # Lite mode: follow-up questions skip Retrieval/Metrics/Risk
-            if memory.is_followup:
-                pipeline = [("analyst", self.analyst_agent)]
-            else:
-                pipeline = [
-                    ("retrieval", self.retrieval_agent),
-                    ("metrics",   self.metrics_agent),
-                    ("analyst",   self.analyst_agent),
-                    ("risk",      self.risk_agent),
-                ]
+            pipeline = [
+                ("retrieval", self.retrieval_agent),
+                ("metrics", self.metrics_agent),
+                ("analyst", self.analyst_agent),
+                ("risk", self.risk_agent),
+            ]
 
             for agent_name, agent in pipeline:
                 yield {"type": "agent_start", "agent": agent_name}
                 try:
-                    if agent_name == "retrieval":
+                    if agent_name in ("retrieval", "analyst"):
                         yield from agent.run(memory, chat_history)
                     else:
                         yield from agent.run(memory)
@@ -1014,6 +916,10 @@ class FinancialController:
             if memory.metrics:
                 yield {"type": "metrics_json", "data": memory.metrics}
 
+            # Emit risk agent's structured output for badge display
+            if memory.risk:
+                yield {"type": "risk_json", "data": memory.risk}
+
             # Final compiled answer (analysis + risk section)
             yield {"type": "final", "text": self._compile_output(memory)}
 
@@ -1026,7 +932,23 @@ class FinancialController:
     # Output compiler
     # ------------------------------------------------------------------
     def _compile_output(self, memory: SharedMemory) -> str:
-        return memory.analysis or "Analysis complete. No additional detail available."
+        parts = []
+        if memory.analysis:
+            parts.append(memory.analysis)
+
+        if memory.risk:
+            score = memory.risk.get("score", "N/A")
+            level = memory.risk.get("level", "Unknown")
+            flags = memory.risk.get("flags", [])
+            explanation = memory.risk.get("explanation", "")
+
+            risk_md = f"\n\n---\n\n### Risk Assessment: {level} ({score}/10)\n"
+            if flags:
+                risk_md += "**Key risk factors:** " + " · ".join(flags) + "\n\n"
+            risk_md += explanation
+            parts.append(risk_md)
+
+        return "".join(parts) or "Analysis complete. No additional detail available."
 
 
 # Backward-compatible alias
