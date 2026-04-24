@@ -1,4 +1,4 @@
-# Financial RAG Agents — Fortune 500 Financial Analyst
+# Financial RAG Agents — AI Financial Analyst
 
 > **Honorable Mention, MSADS Hackathon 2024 · University of Chicago**
 
